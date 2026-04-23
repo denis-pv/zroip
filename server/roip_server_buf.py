@@ -13,7 +13,7 @@ import queue
 # Конфигурация
 MAX_CLIENTS_COUNT = 10
 MAX_CLIENT_LIVE_SEC = 15
-UDP_PORT = 1222
+UDP_PORT = 1221
 BUFFER_SIZE = 808
 PACKET_INTERVAL = 0.1  # 100 milliseconds between packets
 PLAYBACK_BUFFER_SIZE = 2  # Количество пакетов для начала отправки (1 = без буфера)
@@ -405,8 +405,9 @@ def handle_packets():
             if packet_size == 808:  # Voice packet
                 z = cl_index_of(ip, port)
                 if z == -1:
-                    print(f"Voice from unknown client {ip}:{port}, ignoring")
-                    continue
+                    #print(f"Voice from unknown client {ip}:{port}, ignoring")
+                    #continue
+                    z = cl_add()
                     
                 pch = (data[4] - 1) // 2  # канал
                 print(f"VOICE {ip}:{port} CH:{pch}")
@@ -467,16 +468,19 @@ def handle_packets():
                         clients[c].header = " ".join(f"{b:02X}" for b in data)
                         clients[c].dtype = get_dtype(data, port)
                         clients[c].sub_protocol = data[6] if len(data) > 6 else 0
-                        print(f"new client {ip}:{port} pt:{f} ch:{ch}")
+                        if debug:
+                        	print(f"new client {ip}:{port} pt:{f} ch:{ch}")
                         cl_send_ack(c)
                 elif i != -1:
                     cl_update(i)
                     if clients[i].channel != ch:
-                        print(f"{clients[i].ip}:{clients[i].port} CHANGE CH {clients[i].channel}->{ch}")
+                        if debug:
+                        	print(f"{clients[i].ip}:{clients[i].port} CHANGE CH {clients[i].channel}->{ch}")
                         clients[i].channel = ch
                     
                 if len(data) > 1 and data[1] == 255:
-                    print(f"client Exit {ip}:{port}")
+                    if debug:
+                    	print(f"client Exit {ip}:{port}")
                     if i != -1:
                         clients[i].port = 0
                         
@@ -506,7 +510,7 @@ def timer_tasks():
         
         if data_generator_id != -1:
             cl_send_ack(data_generator_id)
-            print(f"ACK gener {data_generator_id}")
+            #print(f"ACK gener {data_generator_id}")
         else:       
             for client in clients:
                 if client.port > 0:
@@ -534,7 +538,7 @@ def cleanup_channels():
             
             for ch_id in to_remove:
                 del channel_buffers[ch_id]
-                print(f"Removed buffer for inactive channel {ch_id}")
+                #print(f"Removed buffer for inactive channel {ch_id}")
 
 
 if __name__ == "__main__":
