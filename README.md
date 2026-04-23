@@ -1,19 +1,18 @@
 # zROIP project
 
-##client 
+## client 
 
 Клиент для zroip server
 
-##rcont
+## rcont
 
 Скрипт мониторинга сервера
 
-##server
+## [Features](https://github.com/denis-pv/zroip/server)
 
 скрипт серверной части
 
-##ptt
+## ptt
 
 Пример кода устройства PTT для ардуино
 
-[Features](/server)
