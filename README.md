@@ -12,4 +12,4 @@
 ##ptt
 Пример кода устройства PTT для ардуино
 
-[Features](server)
+[Features](/server)
