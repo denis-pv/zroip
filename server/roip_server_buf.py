@@ -13,7 +13,7 @@ import queue
 # Конфигурация
 MAX_CLIENTS_COUNT = 10
 MAX_CLIENT_LIVE_SEC = 15
-UDP_PORT = 1221
+UDP_PORT = 1222
 BUFFER_SIZE = 808
 PACKET_INTERVAL = 0.1  # 100 milliseconds between packets
 PLAYBACK_BUFFER_SIZE = 2  # Количество пакетов для начала отправки (1 = без буфера)
