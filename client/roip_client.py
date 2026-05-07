@@ -1,47 +1,295 @@
 """
-ROIP Client for HAM Radio
-Supports mu-law encoding/decoding with XOR encryption
-Packet size: 800 bytes audio data, sent every 100ms
+ROIP Client for HAM Radio - Minimal version with full duplex support
 """
 
 import socket
 import threading
 import time
 import pyaudio
-from datetime import datetime
-from audio_codec import AudioCodec, SimpleHighPassFilter, ButterworthHighPass
+import struct
+import math
+import queue
 
-# ========== CONFIGURATION ==========
-SERVER_IP = "api.k240.ru"  # Change to your server IP
+# ========== GLOBAL CONFIGURATION ==========
+SERVER_IP = "api.k240.ru"
 SERVER_PORT = 1222
-BUFFER_SIZE = 808  # 8 bytes header + 800 bytes audio
-AUDIO_CHUNK = 800   # 800 samples = 100ms audio at 8000 Hz
-SAMPLE_RATE = 8000  # 8 kHz for VoIP
-KEEP_ALIVE_INTERVAL = 15  # seconds
-PACKET_INTERVAL = 0.1  # 100 milliseconds between packets
+BUFFER_SIZE = 808
+AUDIO_CHUNK = 800
+SAMPLE_RATE = 8000
+KEEP_ALIVE_INTERVAL = 15
+PACKET_INTERVAL = 0.1
 
-# Codec selection (default HAM)
-CODEC_TYPE = 2  # D_ROIP_G711HAM
+CODEC_TYPE = 2
+ROIP_CHANNEL = 1
 
-# High-pass filter settings
 ENABLE_HIGHPASS_FILTER = True
 HIGHPASS_CUTOFF_FREQ = 300
 HIGHPASS_GAIN_DB = 9.0
-FILTER_TYPE = "butterworth"  # "rc" or "butterworth"
 
-# Playback buffer settings
 PLAYBACK_BUFFER_SIZE = 2
-PLAYBACK_QUEUE_MAX = 50
+PLAYBACK_QUEUE_MAX = 1
 
-# Packet types
-D_ROIPC_G711 = 1
 D_ROIP_G711HAM = 2
-D_WAIS_G711 = 3
-D_GSM = 4
-D_GSMHAM = 5
-D_FRSF_JHAM = 6
 
 
+# Настройки AGC для входящего звука
+ENABLE_AGC = True           # Включить AGC
+AGC_TARGET_LEVEL = 15000    # Целевой уровень громкости (1000-30000)
+AGC_ATTACK_MS = 10          # Скорость усиления тихих звуков (мс)
+AGC_RELEASE_MS = 100        # Скорость ослабления громких звуков (мс)
+AGC_MAX_GAIN = 3.0          # Максимальное усиление (3x = 9.5dB)
+
+
+class AudioAGC:
+    """Automatic Gain Control - нормализация громкости входящего звука"""
+    
+    def __init__(self, target_level=15000, attack_ms=10, release_ms=100, max_gain=3.0):
+        """
+        target_level: целевой уровень амплитуды (0-32767, рекомендую 12000-18000)
+        attack_ms: скорость увеличения усиления (мс)
+        release_ms: скорость уменьшения усиления (мс)
+        max_gain: максимальное усиление для тихих сигналов (4x = 12dB)
+        """
+        self.target_level = target_level
+        self.attack = attack_ms / 1000.0
+        self.release = release_ms / 1000.0
+        self.max_gain = max_gain
+        self.current_gain = 1.0
+        self.sample_rate = 8000
+        self.enabled = True
+    
+    def process(self, data: bytes) -> bytes:
+        """Применение AGC к аудиоданным"""
+        if not self.enabled or len(data) == 0:
+            return data
+        
+        # Конвертируем в список сэмплов
+        samples = []
+        for i in range(0, len(data), 2):
+            sample = struct.unpack('<h', data[i:i+2])[0]
+            samples.append(sample)
+        
+        # Находим пиковое значение в этом блоке
+        peak = max(abs(s) for s in samples)
+        if peak == 0:
+            peak = 1
+        
+        # Вычисляем нужное усиление
+        target_gain = self.target_level / peak
+        target_gain = min(target_gain, self.max_gain)
+        target_gain = max(target_gain, 0.5)  # Не уменьшаем слишком сильно
+        
+        # Плавно меняем усиление (для избежания щелчков)
+        dt = len(samples) / self.sample_rate
+        if target_gain > self.current_gain:
+            # Attack - быстро увеличиваем (тихий звук становится громче)
+            self.current_gain += (target_gain - self.current_gain) * min(1.0, dt / self.attack)
+        else:
+            # Release - медленно уменьшаем (громкий звук)
+            self.current_gain += (target_gain - self.current_gain) * min(1.0, dt / self.release)
+        
+        # Применяем усиление
+        result = bytearray()
+        for sample in samples:
+            new_sample = int(sample * self.current_gain)
+            new_sample = max(-32767, min(32767, new_sample))
+            result.extend(struct.pack('<h', new_sample))
+        
+        return bytes(result)
+    
+    def enable(self):
+        self.enabled = True
+        self.current_gain = 1.0
+    
+    def disable(self):
+        self.enabled = False
+        self.current_gain = 1.0
+    
+    def set_target_level(self, level: int):
+        """Изменение целевого уровня громкости"""
+        self.target_level = max(1000, min(30000, level))
+
+
+# ========== AUDIO CODEC (unchanged) ==========
+U2L_TABLE = [
+    -32124, -31100, -30076, -29052, -28028, -27004, -25980, -24956,
+    -23932, -22908, -21884, -20860, -19836, -18812, -17788, -16764,
+    -15996, -15484, -14972, -14460, -13948, -13436, -12924, -12412,
+    -11900, -11388, -10876, -10364, -9852, -9340, -8828, -8316,
+    -7932, -7676, -7420, -7164, -6908, -6652, -6396, -6140,
+    -5884, -5628, -5372, -5116, -4860, -4604, -4348, -4092,
+    -3900, -3772, -3644, -3516, -3388, -3260, -3132, -3004,
+    -2876, -2748, -2620, -2492, -2364, -2236, -2108, -1980,
+    -1884, -1820, -1756, -1692, -1628, -1564, -1500, -1436,
+    -1372, -1308, -1244, -1180, -1116, -1052, -988, -924,
+    -876, -844, -812, -780, -748, -716, -684, -652,
+    -620, -588, -556, -524, -492, -460, -428, -396,
+    -372, -356, -340, -324, -308, -292, -276, -260,
+    -244, -228, -212, -196, -180, -164, -148, -132,
+    -120, -112, -104, -96, -88, -80, -72, -64,
+    -56, -48, -40, -32, -24, -16, -8, 0,
+    32124, 31100, 30076, 29052, 28028, 27004, 25980, 24956,
+    23932, 22908, 21884, 20860, 19836, 18812, 17788, 16764,
+    15996, 15484, 14972, 14460, 13948, 13436, 12924, 12412,
+    11900, 11388, 10876, 10364, 9852, 9340, 8828, 8316,
+    7932, 7676, 7420, 7164, 6908, 6652, 6396, 6140,
+    5884, 5628, 5372, 5116, 4860, 4604, 4348, 4092,
+    3900, 3772, 3644, 3516, 3388, 3260, 3132, 3004,
+    2876, 2748, 2620, 2492, 2364, 2236, 2108, 1980,
+    1884, 1820, 1756, 1692, 1628, 1564, 1500, 1436,
+    1372, 1308, 1244, 1180, 1116, 1052, 988, 924,
+    876, 844, 812, 780, 748, 716, 684, 652,
+    620, 588, 556, 524, 492, 460, 428, 396,
+    372, 356, 340, 324, 308, 292, 276, 260,
+    244, 228, 212, 196, 180, 164, 148, 132,
+    120, 112, 104, 96, 88, 80, 72, 64,
+    56, 48, 40, 32, 24, 16, 8, 0
+]
+
+EXP_LUT = [
+    0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7
+]
+
+
+class AudioCodec:
+    @staticmethod
+    def linear_to_ulaw(sample: int) -> int:
+        if sample > 32767:
+            sample = 32767
+        elif sample < -32768:
+            sample = -32768
+        sign = (sample >> 8) & 0x80
+        if sign != 0:
+            sample = -sample
+        if sample > 32635:
+            sample = 32635
+        sample += 132
+        exponent = EXP_LUT[(sample >> 7) & 0xFF]
+        mantissa = (sample >> (exponent + 3)) & 0x0F
+        ulawbyte = ~(sign | (exponent << 4) | mantissa)
+        if ulawbyte == 0:
+            ulawbyte = 2
+        return ulawbyte & 0xFF
+    
+    @staticmethod
+    def ulaw_to_linear(ulawbyte: int) -> int:
+        return U2L_TABLE[ulawbyte & 0xFF]
+    
+    @staticmethod
+    def encode_pcm_to_ulaw(pcm_data: bytes) -> bytes:
+        ulaw_data = bytearray()
+        for i in range(0, len(pcm_data), 2):
+            sample = struct.unpack('<h', pcm_data[i:i+2])[0]
+            ulaw_data.append(AudioCodec.linear_to_ulaw(sample))
+        return bytes(ulaw_data)
+    
+    @staticmethod
+    def decode_ulaw_to_pcm(ulaw_data: bytes) -> bytes:
+        pcm_data = bytearray()
+        for byte in ulaw_data:
+            sample = AudioCodec.ulaw_to_linear(byte)
+            pcm_data.extend(struct.pack('<h', sample))
+        return bytes(pcm_data)
+    
+    @staticmethod
+    def xor_encrypt(data: bytes, key: int = 0xAA) -> bytes:
+        return bytes([b ^ key for b in data])
+    
+    @staticmethod
+    def encode_audio_for_ham(pcm_data: bytes) -> bytes:
+        ulaw_data = AudioCodec.encode_pcm_to_ulaw(pcm_data)
+        return AudioCodec.xor_encrypt(ulaw_data)
+    
+    @staticmethod
+    def decode_audio_from_ham(encrypted_data: bytes) -> bytes:
+        ulaw_data = AudioCodec.xor_encrypt(encrypted_data)
+        return AudioCodec.decode_ulaw_to_pcm(ulaw_data)
+
+
+class ButterworthHighPass:
+    def __init__(self, cutoff_freq: int = 200, sample_rate: int = 8000, gain_db: float = 6.0):
+        self.cutoff_freq = cutoff_freq
+        self.sample_rate = sample_rate
+        self.gain_db = gain_db
+        self.gain_linear = 10 ** (gain_db / 20)
+        self.enabled = True
+        self.x1 = self.x2 = self.y1 = self.y2 = 0
+        self._calculate_coefficients()
+    
+    def _calculate_coefficients(self):
+        w0 = 2 * math.pi * self.cutoff_freq / self.sample_rate
+        cos_w0 = math.cos(w0)
+        sin_w0 = math.sin(w0)
+        Q = 0.7071067811865476
+        alpha = sin_w0 / (2 * Q)
+        b0 = (1 + cos_w0) / 2
+        b1 = -(1 + cos_w0)
+        b2 = (1 + cos_w0) / 2
+        a0 = 1 + alpha
+        a1 = -2 * cos_w0
+        a2 = 1 - alpha
+        self.b0 = b0 / a0
+        self.b1 = b1 / a0
+        self.b2 = b2 / a0
+        self.a1 = a1 / a0
+        self.a2 = a2 / a0
+    
+    def process(self, data: bytes) -> bytes:
+        if not self.enabled:
+            return data
+        samples = []
+        for i in range(0, len(data), 2):
+            x = struct.unpack('<h', data[i:i+2])[0]
+            y = (self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2 
+                 - self.a1 * self.y1 - self.a2 * self.y2)
+            self.x2 = self.x1
+            self.x1 = x
+            self.y2 = self.y1
+            self.y1 = y
+            y = y * self.gain_linear
+            y = max(-32768, min(32767, int(y)))
+            samples.append(y)
+        result = bytearray()
+        for sample in samples:
+            result.extend(struct.pack('<h', sample))
+        return bytes(result)
+    
+    def set_cutoff(self, cutoff_freq: int):
+        if cutoff_freq == self.cutoff_freq:
+            return
+        self.cutoff_freq = cutoff_freq
+        self._calculate_coefficients()
+        self.x1 = self.x2 = self.y1 = self.y2 = 0
+    
+    def set_gain(self, gain_db: float):
+        self.gain_db = gain_db
+        self.gain_linear = 10 ** (gain_db / 20)
+    
+    def enable(self):
+        self.enabled = True
+        self.x1 = self.x2 = self.y1 = self.y2 = 0
+    
+    def disable(self):
+        self.enabled = False
+        self.x1 = self.x2 = self.y1 = self.y2 = 0
+
+
+# ========== ROIP CLIENT ==========
 class ROIPClient:
     def __init__(self):
         self.sock = None
@@ -49,133 +297,70 @@ class ROIPClient:
         self.running = True
         self.connected = False
         self.packet_counter = 0
-        self.channel = 1
+        self.channel = ROIP_CHANNEL
         
-        # Audio
         self.audio = pyaudio.PyAudio()
         self.stream_in = None
         self.stream_out = None
         
-        # Threads
-        self.keep_alive_thread = None
         self.receive_thread = None
+        self.keep_alive_thread = None
         self.transmit_thread = None
         
-        # Statistics
-        self.last_ack_time = None
         self.packets_sent = 0
         self.packets_received = 0
+
+
+        # AGC для входящего звука
+        self.agc = AudioAGC(
+            target_level=AGC_TARGET_LEVEL,
+            attack_ms=AGC_ATTACK_MS,
+            release_ms=AGC_RELEASE_MS,
+            max_gain=AGC_MAX_GAIN
+        )
+        if not ENABLE_AGC:
+            self.agc.disable()
+
         
-        # Playback buffer
-        self.playback_queue = []
-        self.playback_queue_lock = threading.Lock()
+        # Playback queue for incoming audio
+        self.playback_queue = queue.Queue(maxsize=PLAYBACK_QUEUE_MAX)
         self.playback_buffer_size = PLAYBACK_BUFFER_SIZE
+        self.playback_running = True
         
-        # Codec
         self.codec = AudioCodec()
         
-        # Filters
-        self.rc_filter = SimpleHighPassFilter(
+        self.highpass_filter = ButterworthHighPass(
             cutoff_freq=HIGHPASS_CUTOFF_FREQ,
             sample_rate=SAMPLE_RATE,
             gain_db=HIGHPASS_GAIN_DB
         )
         
-        self.butterworth_filter = ButterworthHighPass(
-            cutoff_freq=HIGHPASS_CUTOFF_FREQ,
-            sample_rate=SAMPLE_RATE,
-            gain_db=HIGHPASS_GAIN_DB
-        )
-        
-        # Select active filter
-        self.filter_type = FILTER_TYPE
-        if self.filter_type == "butterworth":
-            self.highpass_filter = self.butterworth_filter
-        else:
-            self.highpass_filter = self.rc_filter
-        
-        if ENABLE_HIGHPASS_FILTER:
-            self.highpass_filter.enable()
-        else:
+        if not ENABLE_HIGHPASS_FILTER:
             self.highpass_filter.disable()
         
-        # Create socket
         self._create_socket()
-        
-        print(f"Initialized with {self.filter_type.upper()} filter")
-        print(f"Playback buffer size: {self.playback_buffer_size} packets")
     
     def _create_socket(self):
-        """Create and configure UDP socket"""
         if self.sock:
             try:
                 self.sock.close()
             except:
                 pass
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(0.5)  # Short timeout for faster shutdown
+        self.sock.settimeout(0.5)
     
-    def switch_filter_type(self):
-        """Switch between RC and Butterworth filters"""
-        was_enabled = self.highpass_filter.enabled
-        current_cutoff = self.highpass_filter.cutoff_freq
-        current_gain = self.highpass_filter.gain_db
-        
-        if self.filter_type == "butterworth":
-            self.filter_type = "rc"
-            self.highpass_filter = self.rc_filter
-            print(f"\nSwitched to RC FILTER")
-        else:
-            self.filter_type = "butterworth"
-            self.highpass_filter = self.butterworth_filter
-            print(f"\nSwitched to BUTTERWORTH FILTER")
-        
-        self.highpass_filter.set_cutoff(current_cutoff)
-        self.highpass_filter.set_gain(current_gain)
-        if was_enabled:
-            self.highpass_filter.enable()
-        else:
-            self.highpass_filter.disable()
-        
-        status = "ON" if self.highpass_filter.enabled else "OFF"
-        print(f"Filter: {status}, Cutoff: {current_cutoff}Hz, Gain: {current_gain}dB")
-    
-    def set_filter_cutoff(self, freq: int):
-        """Change filter cutoff frequency"""
-        if not self.running:
-            return
-        self.highpass_filter.set_cutoff(freq)
-        self.rc_filter.set_cutoff(freq)
-        self.butterworth_filter.set_cutoff(freq)
-    
-    def set_filter_gain(self, gain_db: float):
-        """Change filter gain"""
-        if not self.running:
-            return
+    def set_gain(self, gain_db: float):
         self.highpass_filter.set_gain(gain_db)
-        self.rc_filter.set_gain(gain_db)
-        self.butterworth_filter.set_gain(gain_db)
-    
-    def set_filter_enabled(self, enabled: bool):
-        """Enable/disable filter"""
-        if not self.running:
-            return
-        if enabled:
-            self.highpass_filter.enable()
-        else:
-            self.highpass_filter.disable()
     
     def get_filter_info(self):
-        """Get current filter information"""
         return {
-            'type': self.filter_type.upper(),
+            'type': 'BUTTERWORTH',
             'enabled': self.highpass_filter.enabled,
             'cutoff': self.highpass_filter.cutoff_freq,
             'gain': self.highpass_filter.gain_db
         }
     
     def init_audio(self) -> bool:
-        """Initialize audio devices"""
         try:
             self.stream_in = self.audio.open(
                 format=pyaudio.paInt16,
@@ -184,8 +369,6 @@ class ROIPClient:
                 input=True,
                 frames_per_buffer=AUDIO_CHUNK
             )
-            print("Microphone initialized (default device)")
-            
             self.stream_out = self.audio.open(
                 format=pyaudio.paInt16,
                 channels=1,
@@ -193,48 +376,22 @@ class ROIPClient:
                 output=True,
                 frames_per_buffer=AUDIO_CHUNK
             )
-            print("Speaker initialized (default device)")
             return True
         except Exception as e:
             print(f"Audio init error: {e}")
             return False
     
-    def make_voice_header(self, buffer: bytearray, packet_type: int):
-        """Create voice packet header (8 bytes)"""
+    def make_voice_header(self, buffer: bytearray):
         for i in range(8):
             buffer[i] = 0
-        
         buffer[0] = self.packet_counter & 0xFF
         self.packet_counter = (self.packet_counter + 1) & 0xFF
-        
-        if packet_type == D_ROIPC_G711:
-            buffer[1] = 5
-            buffer[3] = 5
-            buffer[4] = self.channel * 2 + 1
-            buffer[6] = 0
-        elif packet_type == D_WAIS_G711:
-            buffer[1] = 5
-            buffer[3] = 5
-            buffer[4] = self.channel * 2 + 1
-            buffer[6] = 1
-        elif packet_type == D_ROIP_G711HAM:
-            buffer[1] = 10
-            buffer[3] = 5
-            buffer[4] = self.channel * 2 + 1
-            buffer[6] = 0
-        elif packet_type == D_GSM:
-            buffer[1] = 1
-            buffer[3] = 10
-            buffer[4] = self.channel * 2 + 1
-            buffer[6] = 1
-        elif packet_type == D_GSMHAM:
-            buffer[1] = 2
-            buffer[3] = 10
-            buffer[4] = self.channel * 2 + 1
-            buffer[6] = 0
+        buffer[1] = 10
+        buffer[3] = 5
+        buffer[4] = self.channel * 2 + 1
+        buffer[6] = 0
     
     def send_keep_alive(self):
-        """Send keep-alive packet every KEEP_ALIVE_INTERVAL seconds"""
         while self.running and self.connected:
             try:
                 if not self.sock:
@@ -248,10 +405,7 @@ class ROIPClient:
                 packet[5] = 0
                 packet[6] = 0
                 packet[7] = 0
-                
                 self.sock.sendto(bytes(packet), (SERVER_IP, SERVER_PORT))
-                print(f"Keep-alive sent (channel {self.channel})")
-                
                 for _ in range(KEEP_ALIVE_INTERVAL):
                     if not self.running or not self.connected:
                         break
@@ -262,138 +416,168 @@ class ROIPClient:
                 time.sleep(5)
     
     def start_transmission(self):
-        """Start audio transmission"""
         if not self.transmitting and self.running:
             self.transmitting = True
             self.transmit_thread = threading.Thread(target=self.transmit_audio, daemon=True)
             self.transmit_thread.start()
+
+    def clear_playback_buffer(self):
+        """Очистить буфер входящих голосовых данных"""
+        cleared = 0
+        try:
+            while not self.playback_queue.empty():
+                try:
+                    self.playback_queue.get_nowait()
+                    cleared += 1
+                except queue.Empty:
+                    break
+            
+            # Сбрасываем AGC состояние
+            if hasattr(self, 'agc'):
+                self.agc.current_gain = 1.0
+            
+            if cleared > 0:
+                print(f"Cleared {cleared} voice packets from buffer")
+        except Exception as e:
+            print(f"Buffer clear error: {e}")
+
     
     def stop_transmission(self):
-        """Stop audio transmission"""
         if self.transmitting:
             self.transmitting = False
             if self.transmit_thread:
                 self.transmit_thread.join(timeout=2)
+            self.clear_playback_buffer()
     
     def transmit_audio(self):
-        """Transmit audio from microphone to server"""
         next_send_time = time.time()
-        packets_in_cycle = 0
-        cycle_start_time = time.time()
-        
-        filter_info = self.get_filter_info()
-        print(f"Filter: {filter_info['type']} [{ 'ON' if filter_info['enabled'] else 'OFF' }] {filter_info['cutoff']}Hz, {filter_info['gain']}dB")
-        
         while self.transmitting and self.running:
             try:
                 if not self.sock:
                     break
-                    
                 pcm_data = self.stream_in.read(AUDIO_CHUNK, exception_on_overflow=False)
-                
-                # Apply filter
                 pcm_data = self.highpass_filter.process(pcm_data)
-                
-                # Encode
-                if CODEC_TYPE == D_ROIP_G711HAM:
-                    encrypted_data = self.codec.encode_audio_for_ham(pcm_data)
-                else:
-                    encrypted_data = self.codec.encode_pcm_to_ulaw(pcm_data)
-                
+                encrypted_data = self.codec.encode_audio_for_ham(pcm_data)
                 packet = bytearray(BUFFER_SIZE)
-                self.make_voice_header(packet, CODEC_TYPE)
+                self.make_voice_header(packet)
                 packet[8:8+len(encrypted_data)] = encrypted_data[:800]
-                
                 self.sock.sendto(bytes(packet), (SERVER_IP, SERVER_PORT))
                 self.packets_sent += 1
-                packets_in_cycle += 1
-                
-                if self.packets_sent % 50 == 0:
-                    current_time = time.time()
-                    elapsed = current_time - cycle_start_time
-                    rate = packets_in_cycle / elapsed if elapsed > 0 else 0
-                    print(f"Sent: {self.packets_sent} packets, Rate: {rate:.1f} pkt/s")
-                    packets_in_cycle = 0
-                    cycle_start_time = current_time
-                
                 current_time = time.time()
                 sleep_time = next_send_time - current_time
-                
                 if sleep_time > 0:
                     time.sleep(sleep_time)
                 elif sleep_time < -PACKET_INTERVAL:
                     next_send_time = current_time
-                
                 next_send_time += PACKET_INTERVAL
-                
             except Exception as e:
                 if self.running and self.transmitting:
                     print(f"Transmission error: {e}")
                 break
+    
+    def playback_worker(self):
+        """Separate thread for playing audio from queue"""
+        buffer_accumulator = []
         
-        print("Transmission thread finished")
+        while self.playback_running and self.running:
+            try:
+                try:
+                    pcm_data = self.playback_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                
+                # Применяем AGC к входящему звуку
+                if self.agc.enabled:
+                    pcm_data = self.agc.process(pcm_data)
+                
+                if self.playback_buffer_size > 1:
+                    buffer_accumulator.append(pcm_data)
+                    if len(buffer_accumulator) >= self.playback_buffer_size:
+                        for data in buffer_accumulator:
+                            if self.stream_out and self.stream_out.is_active():
+                                self.stream_out.write(data)
+                        buffer_accumulator = []  # Очищаем после воспроизведения
+                else:
+                    if self.stream_out and self.stream_out.is_active():
+                        self.stream_out.write(pcm_data)
+                        
+            except Exception as e:
+                print(f"Playback error: {e}")
+        
+        # Play remaining packets before exit
+        for data in buffer_accumulator:
+            try:
+                if self.stream_out and self.stream_out.is_active():
+                    self.stream_out.write(data)
+            except:
+                pass
+        buffer_accumulator = []  # Очищаем при выходе
     
     def receive_audio(self):
-        """Receive audio from server and play with buffering"""
-        print(f"Waiting for incoming audio... (buffer size: {self.playback_buffer_size} packets)")
+        """Receive audio from server and add to queue"""
+        voice_start_time = None
+        voice_active = False
+        
+        # Start playback worker thread
+        playback_thread = threading.Thread(target=self.playback_worker, daemon=True)
+        playback_thread.start()
         
         while self.running:
             try:
                 if not self.sock:
                     break
-                    
                 data, addr = self.sock.recvfrom(BUFFER_SIZE)
-                
                 if not self.running:
                     break
-                
-                if len(data) == 808:  # Voice packet
+                    
+                if len(data) == 808:
+                    if not voice_active:
+                        voice_start_time = time.time()
+                        voice_active = True
+                        print(f"{time.strftime('%H:%M:%S')} RECEIVE ...", end='', flush=True)
+                    
                     audio_data = data[8:808]
+                    pcm_data = self.codec.decode_audio_from_ham(audio_data)
                     
-                    if CODEC_TYPE == D_ROIP_G711HAM:
-                        pcm_data = self.codec.decode_audio_from_ham(audio_data)
-                    else:
-                        pcm_data = self.codec.decode_ulaw_to_pcm(audio_data)
-                    
-                    with self.playback_queue_lock:
-                        self.playback_queue.append(pcm_data)
-                        
-                        if len(self.playback_queue) > PLAYBACK_QUEUE_MAX:
-                            self.playback_queue.pop(0)
-                        
-                        if len(self.playback_queue) >= self.playback_buffer_size:
-                            to_play = self.playback_queue.pop(0)
-                            if self.stream_out and self.stream_out.is_active():
-                                self.stream_out.write(to_play)
+                    # Add to queue for playback (non-blocking)
+                    try:
+                        self.playback_queue.put_nowait(pcm_data)
+                    except queue.Full:
+                        # Queue is full, remove oldest and add new
+                        try:
+                            self.playback_queue.get_nowait()
+                            self.playback_queue.put_nowait(pcm_data)
+                        except:
+                            pass
                     
                     self.packets_received += 1
                     
-                    if self.packets_received % 50 == 0:
-                        with self.playback_queue_lock:
-                            queue_size = len(self.playback_queue)
-                        print(f"Received: {self.packets_received} packets, Queue: {queue_size}")
-                
-                elif len(data) == 8:  # ACK packet
-                    self.last_ack_time = datetime.now()
-                    
             except socket.timeout:
+                if voice_active:
+                    elapsed = time.time() - voice_start_time
+                    print(f" {elapsed:.1f}s")
+                    voice_active = False
                 continue
             except OSError as e:
-                if self.running:
-                    if e.winerror != 10038:  # Not a socket error
-                        print(f"Receive error: {e}")
+                if self.running and hasattr(e, 'winerror') and e.winerror != 10038:
+                    print(f"Receive error: {e}")
                 break
             except Exception as e:
                 if self.running:
                     print(f"Receive error: {e}")
                 break
+        
+        if voice_active:
+            elapsed = time.time() - voice_start_time
+            print(f" {elapsed:.1f}s")
+        
+        self.playback_running = False
+        playback_thread.join(timeout=2)
     
     def connect(self) -> bool:
-        """Connect to ROIP server"""
         try:
             if not self.sock:
                 self._create_socket()
-                
             reg_packet = bytearray(8)
             reg_packet[0] = 0
             reg_packet[1] = 10
@@ -403,24 +587,19 @@ class ROIPClient:
             reg_packet[5] = 0
             reg_packet[6] = 0
             reg_packet[7] = 0
-            
             self.sock.sendto(bytes(reg_packet), (SERVER_IP, SERVER_PORT))
-            print(f"Connected to {SERVER_IP}:{SERVER_PORT}")
             self.connected = True
             return True
-            
         except Exception as e:
             print(f"Connection error: {e}")
             return False
     
     def disconnect(self):
-        """Disconnect from server"""
-        print("Disconnecting...")
         self.running = False
         self.connected = False
         self.transmitting = False
+        self.playback_running = False
         
-        # Send disconnect packet
         try:
             if self.sock:
                 disc_packet = bytearray(8)
@@ -428,81 +607,55 @@ class ROIPClient:
                 self.sock.sendto(bytes(disc_packet), (SERVER_IP, SERVER_PORT))
         except:
             pass
-        
-        # Close socket
         try:
             if self.sock:
                 self.sock.close()
                 self.sock = None
         except:
             pass
-        
-        # Close audio streams
         try:
             if self.stream_in:
                 self.stream_in.stop_stream()
                 self.stream_in.close()
         except:
             pass
-            
         try:
             if self.stream_out:
                 self.stream_out.stop_stream()
                 self.stream_out.close()
         except:
             pass
-        
         try:
             self.audio.terminate()
         except:
             pass
-        
-        print("Disconnected")
-    
-    def debug_audio_devices(self):
-        """Print audio device information"""
-        print("\n=== Audio Devices ===")
-        print("\nInput devices (microphones):")
-        for i in range(self.audio.get_device_count()):
-            dev_info = self.audio.get_device_info_by_index(i)
-            if dev_info.get('maxInputChannels', 0) > 0:
-                is_default = dev_info.get('defaultSampleRate', 0) > 0
-                default_mark = " [DEFAULT]" if is_default else ""
-                print(f"  [{i}]{default_mark} - {dev_info.get('name')}")
-        
-        print("\nOutput devices (speakers):")
-        for i in range(self.audio.get_device_count()):
-            dev_info = self.audio.get_device_info_by_index(i)
-            if dev_info.get('maxOutputChannels', 0) > 0:
-                is_default = dev_info.get('defaultSampleRate', 0) > 0
-                default_mark = " [DEFAULT]" if is_default else ""
-                print(f"  [{i}]{default_mark} - {dev_info.get('name')}")
-        
-        print("\n" + "="*30)
+
+
+
+
+    def set_channel(self, channel: int):
+        """Change channel (1-8)"""
+        if 0 <= channel <= 9:
+            self.channel = channel
+            self.packet_counter = 0
+            print(f"Channel changed to {channel}")
+        else:
+            print(f"Invalid channel: {channel}. Use 1-8")
+         
     
     def run(self) -> bool:
-        """Run the ROIP client"""
-        print("=== ROIP Client for HAM Radio ===")
+        print("=== ROIP Client ===")
         print(f"Server: {SERVER_IP}:{SERVER_PORT}")
         print(f"Channel: {self.channel}")
-        print(f"Codec: {'HAM (mu-law + XOR)' if CODEC_TYPE == D_ROIP_G711HAM else 'Commercial (mu-law only)'}")
-        print(f"Packet size: {AUDIO_CHUNK} samples ({PACKET_INTERVAL*1000:.0f}ms)")
-        print(f"Playback buffer: {self.playback_buffer_size} packet(s)")
-        print()
         
         if not self.init_audio():
             return False
-        
-        #self.debug_audio_devices()
-        
         if not self.connect():
             return False
         
         self.receive_thread = threading.Thread(target=self.receive_audio, daemon=True)
         self.keep_alive_thread = threading.Thread(target=self.send_keep_alive, daemon=True)
-        
         self.receive_thread.start()
         self.keep_alive_thread.start()
         
-        print("\nClient ready.")
         return True

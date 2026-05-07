@@ -1,193 +1,242 @@
 """
-Main entry point for ROIP Client
-Handles keyboard shortcuts: Alt+1 for PTT (Push-to-Talk)
-Filter controls: F1, F2, F3, F4, F5, F6
+Minimal ROIP Client with keyboard and Arduino PTT support
+Press SPACE or Alt+1 to talk, ESC to exit, +/- to adjust gain
+Press 1-9 to change channel
+Press A to toggle AGC, T/G to adjust target level
 """
 
 import sys
 import threading
 import time
-import keyboard
+import msvcrt
+import ctypes
+from ctypes import wintypes
 from roip_client import ROIPClient
+from ptt import ArduinoPTT
 
-class ROIPController:
-    def __init__(self):
-        self.client = ROIPClient()
-        self.running = True
-        self.ptt_active = False
-        self.transmission_lock = threading.Lock()
-        
-        # Для управления фильтром 
-        self.filter_freq = 400
-        self.last_filter_change = 0
-        
-        # Настройка горячих клавиш
-        keyboard.add_hotkey('alt+1', self.on_ptt_press)
-        keyboard.add_hotkey('alt+1', self.on_ptt_release, trigger_on_release=True)
-        keyboard.add_hotkey('alt+space', self.on_ptt_press)
-        keyboard.add_hotkey('alt+space', self.on_ptt_release, trigger_on_release=True)
-        
-        # Управление фильтром
-        keyboard.add_hotkey('f1', self.toggle_filter)
-        keyboard.add_hotkey('f2', self.decrease_cutoff)
-        keyboard.add_hotkey('f3', self.increase_cutoff)
-        keyboard.add_hotkey('f4', self.decrease_gain)
-        keyboard.add_hotkey('f5', self.increase_gain)
-        keyboard.add_hotkey('f6', self.switch_filter_type)
-        
-        # ESC для выхода
-        keyboard.add_hotkey('esc', self.on_exit)
-    
-    def is_ptt_pressed(self) -> bool:
-        """Check if PTT combination is currently pressed"""
-        try:
-            alt_pressed = keyboard.is_pressed('alt')
-            grave_pressed = keyboard.is_pressed('1')
-            alt_space = keyboard.is_pressed('alt') and keyboard.is_pressed('space')
-            
-            return (alt_pressed and grave_pressed) or alt_space
-        except:
-            return False
-    
-    def switch_filter_type(self):
-        """Switch between RC and Butterworth filters"""
-        self.client.switch_filter_type()
-    
-    def decrease_gain(self):
-        """Decrease gain by 1 dB"""
-        current_gain = self.client.highpass_filter.gain_db
-        new_gain = max(0, current_gain - 1)
-        self.client.set_filter_gain(new_gain)
-        print(f" Gain: {new_gain:.1f} dB")
 
-    def increase_gain(self):
-        """Increase gain by 1 dB"""
-        current_gain = self.client.highpass_filter.gain_db
-        new_gain = min(24, current_gain + 1)
-        self.client.set_filter_gain(new_gain)
-        print(f" Gain: {new_gain:.1f} dB")
-    
-    def on_ptt_press(self):
-        """Called when PTT key is pressed"""
-        with self.transmission_lock:
-            if not self.ptt_active and self.client.running:
-                self.ptt_active = True
-                print(" TRANSMIT STARTED")
-                threading.Thread(target=self.client.start_transmission, daemon=True).start()
-    
-    def on_ptt_release(self):
-        """Called when PTT key is released"""
-        with self.transmission_lock:
-            if self.ptt_active:
-                self.ptt_active = False
-                print(" TRANSMIT STOPPED")
-                threading.Thread(target=self.client.stop_transmission, daemon=True).start()
-    
-    def toggle_filter(self):
-        """Toggle high-pass filter on/off"""
-        new_state = not self.client.highpass_filter.enabled
-        self.client.set_filter_enabled(new_state)
-        filter_info = self.client.get_filter_info()
-        print(f"\nFilter: {'ON' if new_state else 'OFF'} ({filter_info['type']}, {filter_info['cutoff']}Hz, {filter_info['gain']}dB)")
-    
-    def decrease_cutoff(self):
-        """Decrease cutoff frequency by 25 Hz"""
-        current_time = time.time()
-        if current_time - self.last_filter_change > 0.2:
-            self.filter_freq = max(50, self.filter_freq - 25)
-            self.client.set_filter_cutoff(self.filter_freq)
-            self.last_filter_change = current_time
-            filter_info = self.client.get_filter_info()
-            print(f"\n Cutoff: {self.filter_freq} Hz ({filter_info['type']}, {'ON' if filter_info['enabled'] else 'OFF'})")
-    
-    def increase_cutoff(self):
-        """Increase cutoff frequency by 25 Hz"""
-        current_time = time.time()
-        if current_time - self.last_filter_change > 0.2:
-            self.filter_freq = min(2000, self.filter_freq + 25)
-            self.client.set_filter_cutoff(self.filter_freq)
-            self.last_filter_change = current_time
-            filter_info = self.client.get_filter_info()
-            print(f"\n Cutoff: {self.filter_freq} Hz ({filter_info['type']}, {'ON' if filter_info['enabled'] else 'OFF'})")
-    
-    def on_exit(self):
-        """Called when ESC is pressed"""
-        print("\n👋 Shutting down...")
-        self.running = False
-        if self.ptt_active:
-            self.client.stop_transmission()
-        self.client.running = False
-        self.client.disconnect()
-    
-    def monitor_ptt_loop(self):
-        """Monitor PTT state in a loop for reliable detection"""
-        last_state = False
-        
-        while self.running:
-            try:
-                current_state = self.is_ptt_pressed()
-                
-                if current_state != last_state:
-                    if current_state and not last_state:
-                        self.on_ptt_press()
-                    elif not current_state and last_state:
-                        self.on_ptt_release()
-                    last_state = current_state
-                
-                time.sleep(0.05)
-                
-            except Exception as e:
-                print(f"Monitor error: {e}")
-                time.sleep(0.1)
-    
-    def run(self):
+# Configuration
+ENABLE_ARDUINO_PTT = True  # Set to False to use only keyboard
+ARDUINO_PORT = None  # None = auto-detect, or specify like "COM3"
+ARDUINO_BAUDRATE = 57600
 
-        """Run the controller"""
-        if not self.client.run():
-            print("Failed to start client")
-            return
+
+def play_two_beeps_crossplatform():
+
+    if sys.platform == 'win32':
+        import winsound
+        FREQ = 300
+        DURATION_MS = 200
+        PAUSE_MS = 200
         
-        filter_info = self.client.get_filter_info()
+        winsound.Beep(FREQ, DURATION_MS)
+        time.sleep(PAUSE_MS / 1000)
+        #winsound.Beep(FREQ, DURATION_MS)
+    else:
+        # Для Linux/Mac используем printf с ASCII bell
+        # (работает не везде, но без зависимостей)
+        print('\a', end='', flush=True)
+        time.sleep(0.02)
+        time.sleep(0.05)
+        print('\a', end='', flush=True)
+
+
+def disable_quick_edit():
+    """Disable QuickEdit mode for Windows console"""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
         
-        print("\n=== PTT Controls ===")
-        print(" Press and hold: Alt+1 or Alt+Space to transmit")
-        print(" Release to stop transmitting")
-        print("\n=== Filter Controls ===")
-        print(f"Current filter: {filter_info['type']} [{ 'ON' if filter_info['enabled'] else 'OFF' }] {filter_info['cutoff']}Hz, {filter_info['gain']}dB")
-        print("  F1 - Toggle filter ON/OFF")
-        print("  F2 - Decrease cutoff frequency (-25 Hz)")
-        print("  F3 - Increase cutoff frequency (+25 Hz)")
-        print("  F4 - Decrease gain (-1 dB)")
-        print("  F5 - Increase gain (+1 dB)")
-        print("  F6 - Switch filter type (RC <-> Butterworth)")
-        print("\n Press ESC to exit")
-        print("=====================\n")
+        # Get current console mode
+        mode = ctypes.c_ulong()
+        kernel32.GetConsoleMode(handle, ctypes.byref(mode))
         
-        monitor_thread = threading.Thread(target=self.monitor_ptt_loop, daemon=True)
-        monitor_thread.start()
-        
-        try:
-            while self.running:
-                time.sleep(0.1)
-        except KeyboardInterrupt:
-            print("\n👋 Interrupted")
-        finally:
-            self.on_exit()
+        # Disable QuickEdit mode (0x0040) and enable extended flags
+        mode.value &= ~0x0040
+        kernel32.SetConsoleMode(handle, mode.value)
+        return True
+    except Exception as e:
+        print(f"Failed to disable QuickEdit: {e}")
+        return False
+
+
+# Call this at the start of your program
+if sys.platform == "win32":
+    disable_quick_edit()
+
+
+def is_alt_pressed():
+    """Check if Alt key is pressed"""
+    user32 = ctypes.windll.user32
+    VK_MENU = 0x12  # Virtual key code for Alt
+    return (user32.GetAsyncKeyState(VK_MENU) & 0x8000) != 0
+
+
+def is_key_pressed(key_code):
+    """Check if specific key is pressed"""
+    user32 = ctypes.windll.user32
+    return (user32.GetAsyncKeyState(key_code) & 0x8000) != 0
+
 
 def main():
-    """Main entry point"""
+    play_two_beeps_crossplatform()
     try:
         import pyaudio
-        import keyboard
     except ImportError as e:
-        print(f"[X] Missing dependency: {e}")
-        print("\nInstall required libraries:")
-        print("pip install pyaudio keyboard")
-        sys.exit(1)
+        print(f"Missing dependency: {e}")
+        print("pip install pyaudio")
+        return
     
-    controller = ROIPController()
-    controller.run()
-    print("Client stopped")
+    client = ROIPClient()
+    if not client.run():
+        print("Failed to start client")
+        return
+    
+    space_pressed = False
+    alt1_pressed = False
+    transmit_start_time = None
+    arduino_ptt = None
+    current_channel = 1
+    
+    # Initialize Arduino PTT if enabled
+    if ENABLE_ARDUINO_PTT:
+        try:
+            arduino_ptt = ArduinoPTT(
+                port=ARDUINO_PORT,
+                baudrate=ARDUINO_BAUDRATE,
+                auto_reconnect=True
+            )
+            arduino_ptt.start()
+            print("Arduino PTT enabled")
+        except Exception as e:
+            print(f"Arduino init failed: {e}")
+            print("Using keyboard only")
+            arduino_ptt = None
+    
+    print("Ready. Press SPACE or Alt+1 to talk, ESC to exit")
+    print("Press 1-9 to change channel, + / - to adjust gain")
+    print("Press A to toggle AGC, T to increase target, G to decrease target")
+    print()
+    
+    # Print current AGC status
+    agc_status = "ON" if client.agc.enabled else "OFF"
+    print(f"AGC: {agc_status}, Target level: {client.agc.target_level}")
+    print()
+    
+    try:
+        while client.running:
+            # Check Arduino PTT state
+            if arduino_ptt and arduino_ptt.is_pressed():
+                if not space_pressed and not alt1_pressed:
+                    space_pressed = True
+                    transmit_start_time = time.time()
+                    print(f"{time.strftime('%H:%M:%S')} TRANSMIT ... ", end='', flush=True)
+                    client.start_transmission()
+            else:
+                # Check Alt+1 combination
+                alt_pressed = is_alt_pressed()
+                key1_pressed = is_key_pressed(0x31)  # 0x31 is '1' key
+                alt1_active = alt_pressed and key1_pressed
+                
+                # Check Alt+1 state
+                if alt1_active and not alt1_pressed and not space_pressed:
+                    alt1_pressed = True
+                    transmit_start_time = time.time()
+                    print(f"{time.strftime('%H:%M:%S')} TRANSMIT ... ", end='', flush=True)
+                    client.start_transmission()
+                elif not alt1_active and alt1_pressed:
+                    alt1_pressed = False
+                    if not space_pressed:
+                        if transmit_start_time:
+                            duration = time.time() - transmit_start_time
+                            print(f"END ({duration:.1f}s)")
+                            transmit_start_time = None
+                        else:
+                            print("END")
+                        client.stop_transmission()
+                
+                # Check keyboard
+                if msvcrt.kbhit():
+                    key = msvcrt.getch()
+                    
+                    if key == b' ':  # Space pressed
+                        if not space_pressed and not alt1_pressed:
+                            space_pressed = True
+                            transmit_start_time = time.time()
+                            print(f"{time.strftime('%H:%M:%S')} TRANSMIT ... ", end='', flush=True)
+                            client.start_transmission()
+                    
+                    elif key == b'\x1b':  # ESC
+                        print("Exiting...")
+                        break
+                    
+                    # Channel selection 0-9
+                    elif key in [b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9']:
+                        new_channel = int(key.decode())
+                        if new_channel != current_channel:
+                            current_channel = new_channel
+                            client.set_channel(current_channel)
+                            print(f"Channel changed to {current_channel}")
+                    
+                    elif key == b'+' or key == b'=':  # Increase gain
+                        current_gain = client.highpass_filter.gain_db
+                        new_gain = min(24, current_gain + 1)
+                        client.set_gain(new_gain)
+                        print(f"Gain: {new_gain:.1f} dB")
+                    
+                    elif key == b'-' or key == b'_':  # Decrease gain
+                        current_gain = client.highpass_filter.gain_db
+                        new_gain = max(0, current_gain - 1)
+                        client.set_gain(new_gain)
+                        print(f"Gain: {new_gain:.1f} dB")
+                    
+                    # AGC Controls
+                    elif key == b'a' or key == b'A':  # A key toggles AGC
+                        if client.agc.enabled:
+                            client.agc.disable()
+                            print("AGC DISABLED")
+                        else:
+                            client.agc.enable()
+                            print(f"AGC ENABLED (target: {client.agc.target_level})")
+                    
+                    elif key == b't' or key == b'T':  # T key increases target
+                        current = client.agc.target_level
+                        new_level = min(30000, current + 1000)
+                        client.agc.set_target_level(new_level)
+                        print(f"AGC target level: {new_level}")
+                    
+                    elif key == b'g' or key == b'G':  # G key decreases target
+                        current = client.agc.target_level
+                        new_level = max(5000, current - 1000)
+                        client.agc.set_target_level(new_level)
+                        print(f"AGC target level: {new_level}")
+                
+                # Check if space is still pressed
+                if space_pressed and (not arduino_ptt or not arduino_ptt.is_pressed()):
+                    user32 = ctypes.windll.user32
+                    VK_SPACE = 0x20
+                    
+                    if not (user32.GetAsyncKeyState(VK_SPACE) & 0x8000):
+                        space_pressed = False
+                        if not alt1_pressed:
+                            if transmit_start_time:
+                                duration = time.time() - transmit_start_time
+                                print(f"END ({duration:.1f}s)")
+                                transmit_start_time = None
+                            else:
+                                print("END")
+                            client.stop_transmission()
+            
+            time.sleep(0.02)
+            
+    except KeyboardInterrupt:
+        print("Interrupted")
+    finally:
+        if arduino_ptt:
+            arduino_ptt.stop()
+        client.disconnect()
+        print("Client stopped")
 
-if __name__ == "__main__":
+
+if __name__ == "__main__":    
     main()
