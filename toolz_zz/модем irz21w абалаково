@@ -1,0 +1,20 @@
+точка доступа
+pt-net
+1212211rdX!
+
+выдает ip серая сеть:
+192.168.17.0/24
+
+подключен к VPN lt2p 
+vpn client_ip: 10.0.5.17
+
+веб морда
+root
+1212211Ptx!
+
+
+
+в настройках firewall 
+разрешить 
+allowed forwards
+ wan-lan и lan-wan
